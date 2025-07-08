@@ -1,8 +1,21 @@
 import requests
 import urllib.parse
+from difflib import SequenceMatcher
 from bibtexparser import parse_string, write_string
 from bibtexparser.model import Entry, Field
 from bibtexparser.library import Library
+
+MONTHS = {
+    1: "Jan", 2: "Feb", 3: "Mar", 4: "Apr",
+    5: "May", 6: "Jun", 7: "Jul", 8: "Aug",
+    9: "Sep", 10: "Oct", 11: "Nov", 12: "Dec"
+}
+
+def is_title_match(original, fetched, threshold=0.85):
+    if not original or not fetched:
+        return False
+    ratio = SequenceMatcher(None, original.lower(), fetched.lower()).ratio()
+    return ratio >= threshold
 
 def fetch_metadata_from_doi(doi):
     headers = {"Accept": "application/vnd.citationstyles.csl+json"}
@@ -22,8 +35,10 @@ def find_doi_by_title_author(title, author=None):
     try:
         response = requests.get(url, timeout=10)
         items = response.json().get("message", {}).get("items", [])
-        if items:
-            return items[0].get("DOI")
+        for item in items:
+            fetched_title = item.get("title", [""])[0]
+            if is_title_match(title, fetched_title):
+                return item.get("DOI")
     except Exception as e:
         print(f"DOI search failed for {title}: {e}")
     return None
@@ -35,30 +50,21 @@ def dict_to_fields(d):
     return [Field(key=k, value=v) for k, v in d.items()]
 
 def clean_entry(entry: Entry, metadata) -> Entry:
+    original_fields = fields_to_dict(entry)
     new_entry = Entry(entry_type=entry.entry_type, key=entry.key, fields=[])
     fields = {}
 
-    # Author
     authors = metadata.get("author", [])
     if authors:
         fields["author"] = " and ".join(
             [f"{a['family']}, {a['given']}" for a in authors if 'family' in a and 'given' in a]
         )
 
-    # Title
     if "title" in metadata:
         fields["title"] = metadata["title"]
 
-    # Get container title or fallbacks
-    container_raw = metadata.get("container-title")
-
-    if isinstance(container_raw, list):
-        container_title = container_raw[0]
-    elif isinstance(container_raw, str):
-        container_title = container_raw
-    else:
-        container_title = None
-
+    container = metadata.get("container-title", [])
+    container_title = container[0] if isinstance(container, list) and container else None
 
     if not container_title:
         if "collection-title" in metadata:
@@ -66,34 +72,40 @@ def clean_entry(entry: Entry, metadata) -> Entry:
         elif "event" in metadata and isinstance(metadata["event"], dict):
             container_title = metadata["event"].get("name")
 
-    # Determine correct field based on entry type
     if container_title:
         if entry.entry_type == "article":
             fields["journal"] = container_title
         elif entry.entry_type in ["inproceedings", "incollection"]:
             fields["booktitle"] = container_title
 
-    # Year
-    if "issued" in metadata and "date-parts" in metadata["issued"]:
-        year = metadata["issued"]["date-parts"][0][0]
-        if isinstance(year, int):
-            fields["year"] = str(year)
+    if "publisher" in metadata:
+        fields["publisher"] = metadata["publisher"]
 
-    # Volume, Issue, Pages
+    if "issued" in metadata and "date-parts" in metadata["issued"]:
+        date_parts = metadata["issued"]["date-parts"][0]
+        if len(date_parts) > 0:
+            fields["year"] = str(date_parts[0])
+        if len(date_parts) > 1:
+            month_num = date_parts[1]
+            if month_num in MONTHS:
+                fields["month"] = MONTHS[month_num]
+
     if "volume" in metadata:
         fields["volume"] = str(metadata["volume"])
     if "issue" in metadata:
         fields["number"] = str(metadata["issue"])
     if "page" in metadata:
         fields["pages"] = metadata["page"]
-
-    # DOI
     if "DOI" in metadata:
         fields["doi"] = metadata["DOI"]
 
+    # Preserve original fields not overridden
+    for key, value in original_fields.items():
+        if key not in fields:
+            fields[key] = value
+
     new_entry.fields = dict_to_fields(fields)
     return new_entry
-
 
 def main():
     input_file = "input.bib"
@@ -109,21 +121,28 @@ def main():
         original_fields = fields_to_dict(entry)
         doi = original_fields.get("doi")
 
-        if not doi:
+        metadata = None
+        if doi:
+            metadata = fetch_metadata_from_doi(doi)
+        else:
             title = original_fields.get("title", "")
             author_field = original_fields.get("author", "")
             author = author_field.split(" and ")[0] if author_field else None
-            doi = find_doi_by_title_author(title, author)
-
-        metadata = fetch_metadata_from_doi(doi) if doi else None
+            found_doi = find_doi_by_title_author(title, author)
+            if found_doi:
+                metadata = fetch_metadata_from_doi(found_doi)
 
         if metadata:
-            cleaned = clean_entry(entry, metadata)
-            cleaned_entries.append(cleaned)
-            print(f"Updated: {entry.key}")
+            try:
+                cleaned = clean_entry(entry, metadata)
+                cleaned_entries.append(cleaned)
+                print(f"Updated: {entry.key}")
+            except Exception as e:
+                print(f"Failed to clean {entry.key}, keeping original. Reason: {e}")
+                cleaned_entries.append(entry)
         else:
             cleaned_entries.append(entry)
-            print(f"Unchanged (no metadata found): {entry.key}")
+            print(f"No metadata found: {entry.key}")
 
     lib = Library()
     lib.__dict__["_blocks"] = cleaned_entries
